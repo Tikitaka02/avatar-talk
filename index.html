@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Avatar Talk — Phase 1: Pose Landmarks</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Avatar Talk <span class="phase">phase 1 — pose landmarks</span></h1>
+      <div id="stage">
+        <video id="webcam" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+        <div id="status">Loading pose model…</div>
+      </div>
+      <div id="hud">
+        <span id="fps">— fps</span>
+        <label><input type="checkbox" id="mirror" checked /> mirror</label>
+      </div>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
