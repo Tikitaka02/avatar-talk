@@ -5,3 +5,4 @@ dist/
 .claude/
 *.mp4
 docs/
+public/avatar/*.vrm

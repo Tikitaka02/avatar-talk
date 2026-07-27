@@ -1,130 +1,101 @@
-import {
-  FilesetResolver,
-  PoseLandmarker,
-  type NormalizedLandmark,
-} from "@mediapipe/tasks-vision";
+import { PoseTracker } from "./tracking";
+import { AvatarViewer } from "./avatar";
 
 const video = document.getElementById("webcam") as HTMLVideoElement;
-const canvas = document.getElementById("overlay") as HTMLCanvasElement;
+const overlay = document.getElementById("overlay") as HTMLCanvasElement;
+const avatarCanvas = document.getElementById("avatar") as HTMLCanvasElement;
 const statusEl = document.getElementById("status") as HTMLDivElement;
+const avatarStatusEl = document.getElementById("avatar-status") as HTMLDivElement;
 const fpsEl = document.getElementById("fps") as HTMLSpanElement;
 const mirrorEl = document.getElementById("mirror") as HTMLInputElement;
 const stage = document.getElementById("stage") as HTMLDivElement;
-const ctx = canvas.getContext("2d")!;
+const expressionsEl = document.getElementById("expressions") as HTMLDivElement;
 
-// Upper body only: landmarks 0–24 (face, arms, torso). Legs (25–32) are
-// unreliable from a desk webcam, so we never draw or use them.
-const UPPER_BODY_CUTOFF = 25;
+const DEFAULT_VRM = "/avatar/test-avatar-talk.vrm";
 
-// Connection pairs limited to the upper body subset of MediaPipe's pose
-// topology: https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker
-const UPPER_BODY_CONNECTIONS: [number, number][] = [
-  // face outline
-  [0, 1], [1, 2], [2, 3], [3, 7], [0, 4], [4, 5], [5, 6], [6, 8], [9, 10],
-  // torso
-  [11, 12], [11, 23], [12, 24], [23, 24],
-  // left arm + hand
-  [11, 13], [13, 15], [15, 17], [15, 19], [15, 21], [17, 19],
-  // right arm + hand
-  [12, 14], [14, 16], [16, 18], [16, 20], [16, 22], [18, 20],
-];
+// Expressions worth exposing as buttons, if the loaded avatar defines them.
+const EXPRESSION_PRESETS = ["blink", "happy", "angry", "sad", "relaxed", "aa"];
 
-const MIN_VISIBILITY = 0.5;
+const tracker = new PoseTracker(video, overlay);
+const viewer = new AvatarViewer(avatarCanvas);
 
-let landmarker: PoseLandmarker | undefined;
-let lastVideoTime = -1;
-
-// Simple moving-average FPS counter
 let frameCount = 0;
 let fpsWindowStart = performance.now();
+let lastFrame = performance.now();
 
 mirrorEl.addEventListener("change", () => {
   stage.classList.toggle("mirrored", mirrorEl.checked);
 });
 stage.classList.toggle("mirrored", mirrorEl.checked);
 
-async function createLandmarker(): Promise<PoseLandmarker> {
-  const vision = await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-  );
-  return PoseLandmarker.createFromOptions(vision, {
-    baseOptions: {
-      modelAssetPath:
-        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-      delegate: "GPU",
-    },
-    runningMode: "VIDEO",
-    numPoses: 1,
-  });
-}
+window.addEventListener("resize", () => viewer.resize());
 
-async function startWebcam(): Promise<void> {
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { width: 1280, height: 720, facingMode: "user" },
-    audio: false,
-  });
-  video.srcObject = stream;
-  await new Promise<void>((resolve) => {
-    video.onloadedmetadata = () => resolve();
-  });
-}
-
-function drawLandmarks(landmarks: NormalizedLandmark[]): void {
-  const w = canvas.width;
-  const h = canvas.height;
-
-  ctx.lineWidth = 3;
-  ctx.strokeStyle = "#4ade80";
-  for (const [a, b] of UPPER_BODY_CONNECTIONS) {
-    const la = landmarks[a];
-    const lb = landmarks[b];
-    if ((la.visibility ?? 1) < MIN_VISIBILITY) continue;
-    if ((lb.visibility ?? 1) < MIN_VISIBILITY) continue;
-    ctx.beginPath();
-    ctx.moveTo(la.x * w, la.y * h);
-    ctx.lineTo(lb.x * w, lb.y * h);
-    ctx.stroke();
-  }
-
-  ctx.fillStyle = "#fb7185";
-  for (let i = 0; i < UPPER_BODY_CUTOFF; i++) {
-    const lm = landmarks[i];
-    if ((lm.visibility ?? 1) < MIN_VISIBILITY) continue;
-    ctx.beginPath();
-    ctx.arc(lm.x * w, lm.y * h, 5, 0, Math.PI * 2);
-    ctx.fill();
+function buildExpressionButtons(): void {
+  expressionsEl.innerHTML = "";
+  const available = viewer.expressionNames;
+  for (const name of EXPRESSION_PRESETS) {
+    if (!available.includes(name)) continue;
+    const btn = document.createElement("button");
+    btn.textContent = name;
+    // Hold to apply, release to relax — easier to demo than a toggle.
+    const on = () => viewer.setExpression(name, 1);
+    const off = () => viewer.setExpression(name, 0);
+    btn.addEventListener("pointerdown", on);
+    btn.addEventListener("pointerup", off);
+    btn.addEventListener("pointerleave", off);
+    expressionsEl.appendChild(btn);
   }
 }
+
+async function loadAvatar(source: string | File): Promise<void> {
+  avatarStatusEl.textContent =
+    typeof source === "string" ? "Loading avatar…" : `Loading ${source.name}…`;
+  avatarStatusEl.classList.remove("hidden");
+  try {
+    await viewer.load(source);
+    buildExpressionButtons();
+    avatarStatusEl.classList.add("hidden");
+  } catch (err) {
+    // The bundled avatar is optional (it is not committed), so a missing
+    // default is a prompt to bring your own rather than an error.
+    avatarStatusEl.textContent =
+      typeof source === "string"
+        ? "No avatar loaded — drop a .vrm file here to begin."
+        : `Could not load ${source.name}: ${err instanceof Error ? err.message : err}`;
+  }
+}
+
+// Drag and drop any .vrm file onto the 3D pane to swap avatars.
+const dropZone = document.getElementById("avatar-pane") as HTMLDivElement;
+dropZone.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  dropZone.classList.add("dragging");
+});
+dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragging"));
+dropZone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dropZone.classList.remove("dragging");
+  const file = e.dataTransfer?.files[0];
+  if (file?.name.toLowerCase().endsWith(".vrm")) loadAvatar(file);
+});
 
 function renderLoop(): void {
-  if (!landmarker) return;
+  const now = performance.now();
+  const delta = (now - lastFrame) / 1000;
+  lastFrame = now;
 
-  // The overlay canvas must match the video's intrinsic resolution so that
-  // normalized landmark coordinates line up with the pixels underneath.
-  if (
-    canvas.width !== video.videoWidth ||
-    canvas.height !== video.videoHeight
-  ) {
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-  }
+  // One loop drives both halves: tracking only advances on new webcam frames,
+  // while the 3D scene redraws every frame so the idle motion stays smooth.
+  const landmarks = tracker.update();
+  viewer.update(delta);
 
-  // Only run inference when the video has a new frame.
-  if (video.currentTime !== lastVideoTime) {
-    lastVideoTime = video.currentTime;
-    const result = landmarker.detectForVideo(video, performance.now());
-
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    if (result.landmarks.length > 0) {
-      drawLandmarks(result.landmarks[0]);
-    }
-
+  if (landmarks) {
     frameCount++;
-    const elapsed = performance.now() - fpsWindowStart;
+    const elapsed = now - fpsWindowStart;
     if (elapsed >= 1000) {
       fpsEl.textContent = `${((frameCount * 1000) / elapsed).toFixed(0)} fps`;
       frameCount = 0;
-      fpsWindowStart = performance.now();
+      fpsWindowStart = now;
     }
   }
 
@@ -132,15 +103,20 @@ function renderLoop(): void {
 }
 
 async function main(): Promise<void> {
+  // The avatar does not depend on the webcam, so load it and start drawing
+  // before touching the camera. Both are awaited later than the render loop
+  // on purpose: a slow permission prompt must not freeze the 3D pane.
+  loadAvatar(DEFAULT_VRM);
+  renderLoop();
+
   try {
     statusEl.textContent = "Loading pose model…";
-    landmarker = await createLandmarker();
+    await tracker.init();
 
     statusEl.textContent = "Requesting webcam…";
-    await startWebcam();
+    await tracker.startWebcam();
 
     statusEl.classList.add("hidden");
-    renderLoop();
   } catch (err) {
     statusEl.textContent =
       err instanceof DOMException && err.name === "NotAllowedError"

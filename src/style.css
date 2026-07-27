@@ -32,17 +32,34 @@ h1 {
   margin-left: 0.5rem;
 }
 
-#stage {
+#split {
+  display: flex;
+  gap: 0.75rem;
+  width: min(95vw, 1500px);
+}
+
+#stage,
+#avatar-pane {
   position: relative;
-  width: min(90vw, 960px);
+  flex: 1;
   aspect-ratio: 4 / 3;
   background: #000;
   border-radius: 8px;
   overflow: hidden;
 }
 
+#avatar-pane {
+  background: #0d0f12;
+  border: 1px solid #23252b;
+}
+
+#avatar-pane.dragging {
+  border-color: #4ade80;
+}
+
 #webcam,
-#overlay {
+#overlay,
+#avatar {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -58,7 +75,8 @@ h1 {
   transform: scaleX(-1);
 }
 
-#status {
+#status,
+#avatar-status {
   position: absolute;
   inset: 0;
   display: grid;
@@ -69,8 +87,24 @@ h1 {
   padding: 1rem;
 }
 
-#status.hidden {
+#status.hidden,
+#avatar-status.hidden {
   display: none;
+}
+
+.drop-hint {
+  position: absolute;
+  bottom: 0.6rem;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-size: 0.75rem;
+  color: #5a616c;
+  pointer-events: none;
+}
+
+#avatar-pane.dragging .drop-hint {
+  color: #4ade80;
 }
 
 #hud {
@@ -79,8 +113,35 @@ h1 {
   align-items: center;
   font-size: 0.85rem;
   color: #8a919c;
+  flex-wrap: wrap;
+  justify-content: center;
 }
 
 #fps {
   font-variant-numeric: tabular-nums;
+}
+
+#expressions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+#expressions button {
+  background: #23252b;
+  color: #d4d4d4;
+  border: 1px solid #2c2d33;
+  border-radius: 5px;
+  padding: 0.25rem 0.7rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+#expressions button:hover {
+  background: #2c2d33;
+}
+
+#expressions button:active {
+  background: #4ade80;
+  color: #14161a;
 }
