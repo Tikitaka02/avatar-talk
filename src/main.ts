@@ -1,5 +1,6 @@
 import { PoseTracker } from "./tracking";
 import { AvatarViewer } from "./avatar";
+import { PoseRetargeter } from "./retarget";
 
 const video = document.getElementById("webcam") as HTMLVideoElement;
 const overlay = document.getElementById("overlay") as HTMLCanvasElement;
@@ -18,6 +19,12 @@ const EXPRESSION_PRESETS = ["blink", "happy", "angry", "sad", "relaxed", "aa"];
 
 const tracker = new PoseTracker(video, overlay);
 const viewer = new AvatarViewer(avatarCanvas);
+const retargeter = new PoseRetargeter();
+
+/** Seconds without a usable pose before the avatar returns to its rest pose. */
+const TRACKING_GRACE = 0.5;
+let sinceTracked = Infinity;
+let lastWorld: import("./tracking").TrackedPose["world"] | null = null;
 
 let frameCount = 0;
 let fpsWindowStart = performance.now();
@@ -53,6 +60,7 @@ async function loadAvatar(source: string | File): Promise<void> {
   avatarStatusEl.classList.remove("hidden");
   try {
     await viewer.load(source);
+    if (viewer.vrm) retargeter.bind(viewer.vrm);
     buildExpressionButtons();
     avatarStatusEl.classList.add("hidden");
   } catch (err) {
@@ -86,10 +94,26 @@ function renderLoop(): void {
 
   // One loop drives both halves: tracking only advances on new webcam frames,
   // while the 3D scene redraws every frame so the idle motion stays smooth.
-  const landmarks = tracker.update();
+  const pose = tracker.update();
+  if (pose) {
+    lastWorld = pose.world;
+    sinceTracked = 0;
+  } else {
+    sinceTracked += delta;
+  }
+
+  // The webcam delivers ~30 poses a second while the display refreshes faster,
+  // so the last pose is re-applied every frame. That keeps the easing running
+  // between camera frames instead of stepping once per new landmark set.
+  const fresh = lastWorld !== null && sinceTracked < TRACKING_GRACE;
+  const posed = fresh && retargeter.apply(lastWorld!, delta);
+  if (!posed) retargeter.releaseToRest(delta);
+
+  // Breathing would fight the tracked spine, so it only runs when idle.
+  viewer.idleMotion = !posed;
   viewer.update(delta);
 
-  if (landmarks) {
+  if (pose) {
     frameCount++;
     const elapsed = now - fpsWindowStart;
     if (elapsed >= 1000) {

@@ -12,6 +12,8 @@ export class AvatarViewer {
   private elapsed = 0;
 
   vrm: VRM | undefined;
+  /** Idle breathing; switched off while pose tracking drives the body. */
+  idleMotion = true;
 
   constructor(private canvas: HTMLCanvasElement) {
     this.renderer = new THREE.WebGLRenderer({
@@ -138,7 +140,7 @@ export class AvatarViewer {
 
     // Idle motion so the avatar reads as alive before retargeting exists:
     // a slow breathing rise in the chest and a small sway in the spine.
-    const humanoid = this.vrm?.humanoid;
+    const humanoid = this.idleMotion ? this.vrm?.humanoid : undefined;
     if (humanoid) {
       const breath = Math.sin(this.elapsed * 1.6);
       const chest = humanoid.getNormalizedBoneNode("chest");

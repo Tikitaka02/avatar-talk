@@ -1,8 +1,16 @@
 import {
   FilesetResolver,
   PoseLandmarker,
+  type Landmark,
   type NormalizedLandmark,
 } from "@mediapipe/tasks-vision";
+
+export interface TrackedPose {
+  /** Screen-space landmarks, normalized 0..1 — used to draw the overlay. */
+  landmarks: NormalizedLandmark[];
+  /** Metric landmarks in a hips-centred space — used to pose the avatar. */
+  world: Landmark[];
+}
 
 // Upper body only: landmarks 0–24 (face, arms, torso). Legs (25–32) are
 // unreliable from a desk webcam, so we never draw or use them.
@@ -24,8 +32,14 @@ const UPPER_BODY_CONNECTIONS: [number, number][] = [
 const MIN_VISIBILITY = 0.5;
 
 export class PoseTracker {
+  /** Frames inference refused. Non-zero means tracking is degraded, not dead. */
+  droppedFrames = 0;
+  lastError = "";
+  firstError = "";
+
   private landmarker: PoseLandmarker | undefined;
   private lastVideoTime = -1;
+  private lastTimestamp = 0;
   private ctx: CanvasRenderingContext2D;
 
   constructor(
@@ -63,9 +77,9 @@ export class PoseTracker {
 
   /**
    * Runs inference if the video has a new frame and redraws the overlay.
-   * Returns the landmarks for this frame, or null if nothing new was processed.
+   * Returns this frame's pose, or null if nothing new was processed.
    */
-  update(): NormalizedLandmark[] | null {
+  update(): TrackedPose | null {
     if (!this.landmarker) return null;
     // No camera (denied, or not ready yet): the video is 0x0 and MediaPipe
     // rejects an empty region of interest, so there is nothing to track.
@@ -85,12 +99,33 @@ export class PoseTracker {
     if (this.video.currentTime === this.lastVideoTime) return null;
     this.lastVideoTime = this.video.currentTime;
 
-    const result = this.landmarker.detectForVideo(this.video, performance.now());
+    // Inference can reject a frame — a repeated timestamp, a decode hiccup. It
+    // throws from inside the render loop, so without this the whole app freezes
+    // for good over one bad frame.
+    // MediaPipe demands strictly increasing timestamps and treats a repeat as
+    // fatal: the graph errors and every later frame fails, so tracking dies for
+    // the session. Two frames can share a millisecond, so force it forward.
+    const timestamp = Math.max(this.lastTimestamp + 1, Math.round(performance.now()));
+    this.lastTimestamp = timestamp;
+
+    let result;
+    try {
+      result = this.landmarker.detectForVideo(this.video, timestamp);
+    } catch (err) {
+      this.droppedFrames++;
+      this.lastError = err instanceof Error ? err.message : String(err);
+      if (!this.firstError) this.firstError = this.lastError;
+      // Clear the overlay too: a stale skeleton left on screen reads as working
+      // tracking and hides the fact that nothing is being detected.
+      this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+      return null;
+    }
+
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    if (result.landmarks.length === 0) return null;
+    if (result.landmarks.length === 0 || result.worldLandmarks.length === 0) return null;
 
     this.draw(result.landmarks[0]);
-    return result.landmarks[0];
+    return { landmarks: result.landmarks[0], world: result.worldLandmarks[0] };
   }
 
   private draw(landmarks: NormalizedLandmark[]): void {
