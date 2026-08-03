@@ -29,15 +29,41 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173 and allow camera access. You should see yourself
-with a green/pink skeleton tracking your face, torso, and arms at ~30 fps,
-next to a 3D avatar.
+Open http://localhost:5173 and allow camera access. On the left you get your
+webcam with a green/pink skeleton over your face, torso and arms at ~30 fps; on
+the right, an avatar doing the same thing. Raise a hand and the avatar raises
+the hand on the same side of the screen — it behaves like a mirror. Drag on the
+3D pane to orbit the camera, and hold an expression button to change the face.
 
 **Bring your own avatar.** No `.vrm` is committed (they are large, and their
 licences are the author's), so the 3D pane starts empty. Drag any VRM file
 onto it — free ones are available on [VRoid Hub](https://hub.vroid.com/), or
 make your own in VRoid Studio. To have one load automatically, drop it in
 `public/avatar/` and point `DEFAULT_VRM` in `src/main.ts` at it.
+
+Needs a browser with WebGL2 and camera access on `localhost` or HTTPS. The pose
+model and its WebAssembly runtime are fetched from a CDN on first load, so that
+much needs a connection — the video itself never leaves the machine.
+
+## The code
+
+| File | What it does |
+|------|--------------|
+| [`src/tracking.ts`](src/tracking.ts) | Webcam capture, MediaPipe inference, skeleton overlay. Returns both screen-space landmarks (to draw) and metric world landmarks (to pose). |
+| [`src/avatar.ts`](src/avatar.ts) | three.js scene, VRM loading, auto-framing, rest pose, idle breathing, expressions. |
+| [`src/retarget.ts`](src/retarget.ts) | Landmarks → bone rotations: coordinate conversion, mirroring, parent-space solve, smoothing. |
+| [`src/main.ts`](src/main.ts) | Wires the three together in one render loop. |
+
+## Known limitations
+
+- **No twist.** Rotations come from the shortest turn between two directions,
+  which says nothing about roll — so a rotated forearm or a tilted wrist is not
+  reproduced. Fixing it needs a second reference axis per bone.
+- **No fingers or facial tracking.** Hands are a single landmark each and the
+  face only drives head direction; the VRM's expressions are still manual.
+- **Depth stays approximate** even with `Z_TRUST` — motion toward and away from
+  the camera is the weakest axis, and always will be with one lens.
+- **Upper body only**, by design: legs are unreliable from a desk webcam.
 
 ## Design notes (phase 3)
 
