@@ -4,11 +4,13 @@ Browser-based motion capture that retargets your webcam movements onto a 3D
 avatar — built step by step as a YouTube / blog series. Everything runs
 client-side: no server, no installs, and no video ever leaves your machine.
 
-**Current state — Phase 4:** three [MediaPipe](https://ai.google.dev/edge/mediapipe)
-models — pose, face and hands — drive a VRM rig rendered with three.js and
+**Current state — Phase 4:** one [MediaPipe](https://ai.google.dev/edge/mediapipe)
+HolisticLandmarker — body, face and hands in a single inference — drives a VRM
+rig rendered with three.js and
 [@pixiv/three-vrm](https://github.com/pixiv/three-vrm). Arms, torso and head
 follow your body; your expressions drive the avatar's face; your fingers curl
-its fingers. Landmarks are filtered with a One Euro filter before retargeting.
+its fingers and your wrists rotate its wrists. Landmarks are filtered with a
+One Euro filter before retargeting.
 
 ## Roadmap
 
@@ -30,8 +32,8 @@ npm run dev
 ```
 
 Open http://localhost:5173 and allow camera access. On the left you get your
-webcam with a green/pink skeleton over your face, torso and arms at ~30 fps; on
-the right, an avatar doing the same thing. Raise a hand and the avatar raises
+webcam with a green/pink skeleton over your face, torso and arms, plus 21 points
+on each hand; on the right, an avatar doing the same thing. Raise a hand and the avatar raises
 the hand on the same side of the screen — it behaves like a mirror. Blink,
 smile or open your mouth and its face follows; curl your fingers and its
 fingers curl. Drag on the 3D pane to orbit the camera, tick **tracking readout**
@@ -52,9 +54,9 @@ much needs a connection — the video itself never leaves the machine.
 
 | File | What it does |
 |------|--------------|
-| [`src/tracking.ts`](src/tracking.ts) | Webcam capture, MediaPipe pose inference, skeleton overlay. Returns both screen-space landmarks (to draw) and metric world landmarks (to pose). |
-| [`src/face.ts`](src/face.ts) | FaceLandmarker: 52 ARKit-style blendshape scores plus a solved head transform. |
-| [`src/hands.ts`](src/hands.ts) | HandLandmarker (21 points per hand) and the finger retargeter. |
+| [`src/tracking.ts`](src/tracking.ts) | Webcam capture and one HolisticLandmarker inference returning body, face and hands together, plus the overlay drawing. |
+| [`src/space.ts`](src/space.ts) | Shared MediaPipe→VRM coordinate conversion and bone-chain maths. |
+| [`src/hands.ts`](src/hands.ts) | Finger curl and wrist rotation from the hand landmarks. |
 | [`src/filter.ts`](src/filter.ts) | One Euro filter, plus banks of them for landmark streams and named scalars. |
 | [`src/expression.ts`](src/expression.ts) | Blendshapes → VRM expressions. |
 | [`src/retarget.ts`](src/retarget.ts) | Landmarks → bone rotations: coordinate conversion, mirroring, parent-space solve. |
@@ -76,17 +78,43 @@ much needs a connection — the video itself never leaves the machine.
 - **Bend only, no splay.** Finger curl is the angle between the two segments
   meeting at each joint. Sideways splay is discarded: far noisier than bend, and
   nearly invisible on a stylised hand.
-- **Handedness is anatomical.** MediaPipe's "Right" is the person's own right
-  hand — verified from landmark positions, not assumed — so it drives the
-  avatar's left, matching the mirrored body.
-- **Three models, one loop.** They share a video frame and a render loop; the
-  lite models hold 30 fps, but this is where the frame budget starts to matter.
+- **Hands come pre-labelled.** Holistic returns `leftHandLandmarks` and
+  `rightHandLandmarks` separately, so nothing has to infer which hand is which.
+  The person's right drives the avatar's left, matching the mirrored body.
+- **Wrist rotation needs the palm.** A shoulder-to-elbow direction can never
+  recover roll. Two vectors across the hand — along the fingers and across the
+  knuckles — define its orientation, and the rotation carrying the rest pose's
+  pair onto the measured pair is the wrist. It is damped and capped, because
+  palm facing is mostly a depth signal and depth is the weakest axis.
+- **Blendshapes force the CPU delegate.** Holistic's blendshape sub-model uses
+  ops the GPU delegate does not implement (`DEQUANTIZE`, `STRIDED_SLICE`); ask
+  for face expressions on GPU and the graph fails to open, which surfaces only
+  as tracking that never starts.
+
+## Measured cost
+
+Numbers from this machine, headless Chromium, 960×669 clip, so treat them as
+relative rather than absolute:
+
+| Setup | Throughput |
+|-------|-----------|
+| Three separate landmarkers (pose + face + hands), GPU | ~9 fps |
+| HolisticLandmarker, GPU, no blendshapes | ~8 fps |
+| HolisticLandmarker, CPU, with blendshapes (current) | ~7 fps |
+
+Holistic is not the speed win its shared detection stage suggests — it is
+slightly slower here. What it buys is one model download instead of three,
+one inference call, and hands labelled by the model. Full-body tracking with
+expressions is simply expensive in a browser; none of these reach 30 fps.
 
 ## Known limitations
 
-- **No twist.** Rotations come from the shortest turn between two directions,
-  which says nothing about roll — so a rotated forearm or a tilted wrist is not
-  reproduced. Fixing it needs a second reference axis per bone.
+- **Twist only at the wrist.** The hand solves its full orientation from the
+  palm, so wrist roll works. The upper arm and forearm still come from a single
+  direction each, which says nothing about roll, so rotating your forearm
+  without moving your hand does not turn the avatar's arm.
+- **It is not fast.** Full-body tracking with expressions costs roughly 7 fps
+  here (see Measured cost). Dropping face blendshapes or hands buys some back.
 - **Expressions depend on the avatar.** Only the VRM expressions a model
   actually defines can be driven; the mapping skips whatever is missing.
 - **Depth stays approximate** even with `Z_TRUST` — motion toward and away from

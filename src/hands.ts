@@ -1,63 +1,9 @@
-import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
-import type { NormalizedLandmark } from "@mediapipe/tasks-vision";
+import * as THREE from "three";
 import type { VRM, VRMHumanBoneName } from "@pixiv/three-vrm";
+import type { Landmark } from "@mediapipe/tasks-vision";
+import type { HandStream } from "./tracking";
 import { OneEuroFilter, ScalarFilterBank } from "./filter";
-
-const WASM_ROOT =
-  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
-const MODEL =
-  "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
-
-export interface TrackedHand {
-  /** "Left" or "Right", as the model labels the person's own hand. */
-  handedness: string;
-  landmarks: NormalizedLandmark[];
-}
-
-export class HandTracker {
-  droppedFrames = 0;
-
-  private landmarker: HandLandmarker | undefined;
-  private lastVideoTime = -1;
-  private lastTimestamp = 0;
-  private last: TrackedHand[] = [];
-
-  constructor(private video: HTMLVideoElement) {}
-
-  async init(): Promise<void> {
-    const vision = await FilesetResolver.forVisionTasks(WASM_ROOT);
-    this.landmarker = await HandLandmarker.createFromOptions(vision, {
-      baseOptions: { modelAssetPath: MODEL, delegate: "GPU" },
-      runningMode: "VIDEO",
-      numHands: 2,
-    });
-  }
-
-  get ready(): boolean {
-    return this.landmarker !== undefined;
-  }
-
-  update(): TrackedHand[] {
-    if (!this.landmarker || this.video.videoWidth === 0) return [];
-    if (this.video.currentTime === this.lastVideoTime) return this.last;
-    this.lastVideoTime = this.video.currentTime;
-
-    const timestamp = Math.max(this.lastTimestamp + 1, Math.round(performance.now()));
-    this.lastTimestamp = timestamp;
-
-    try {
-      const result = this.landmarker.detectForVideo(this.video, timestamp);
-      this.last = result.landmarks.map((landmarks, i) => ({
-        handedness: result.handedness[i]?.[0]?.categoryName ?? "Right",
-        landmarks,
-      }));
-      return this.last;
-    } catch {
-      this.droppedFrames++;
-      return [];
-    }
-  }
-}
+import { toAvatarSpace, chainWorldQuaternion, FOREARM_CHAINS, ease } from "./space";
 
 /** MediaPipe hand landmark indices, four joints per finger from knuckle to tip. */
 const FINGERS: { name: string; chain: [number, number, number, number] }[] = [
@@ -72,40 +18,89 @@ const FINGERS: { name: string; chain: [number, number, number, number] }[] = [
 const SEGMENTS = ["Proximal", "Intermediate", "Distal"] as const;
 const THUMB_SEGMENTS = ["Metacarpal", "Proximal", "Distal"] as const;
 
+const WRIST = 0;
+const INDEX_MCP = 5;
+const MIDDLE_MCP = 9;
+const PINKY_MCP = 17;
+
 const MAX_CURL = 1.6;
 /** The thumb folds across the palm rather than curling, so it gets less. */
 const THUMB_SCALE = 0.55;
 
-function angleBetween(
-  a: NormalizedLandmark,
-  b: NormalizedLandmark,
-  c: NormalizedLandmark
-): number {
-  const v1 = { x: b.x - a.x, y: b.y - a.y, z: b.z - a.z };
-  const v2 = { x: c.x - b.x, y: c.y - b.y, z: c.z - b.z };
-  const l1 = Math.hypot(v1.x, v1.y, v1.z);
-  const l2 = Math.hypot(v2.x, v2.y, v2.z);
+/**
+ * Wrist rotation is damped and capped. Palm orientation depends on depth, the
+ * weakest axis a single camera has, so a raw solve snaps around whenever the
+ * model changes its mind about which way the hand is facing.
+ */
+const WRIST_DAMPING = 0.75;
+const MAX_WRIST_ANGLE = Math.PI * 0.6;
+
+/**
+ * Rest orientation of each hand in the normalized rig. VRM's T-pose has the
+ * arms along ±x with the palms facing down and the thumbs forward, so the
+ * knuckles run from index at +z to little finger at -z on both hands.
+ */
+const REST_BASIS = {
+  left: { forward: new THREE.Vector3(1, 0, 0), side: new THREE.Vector3(0, 0, -1) },
+  right: { forward: new THREE.Vector3(-1, 0, 0), side: new THREE.Vector3(0, 0, -1) },
+};
+
+function angleBetween(a: Landmark, b: Landmark, c: Landmark): number {
+  const v1x = b.x - a.x, v1y = b.y - a.y, v1z = b.z - a.z;
+  const v2x = c.x - b.x, v2y = c.y - b.y, v2z = c.z - b.z;
+  const l1 = Math.hypot(v1x, v1y, v1z);
+  const l2 = Math.hypot(v2x, v2y, v2z);
   if (l1 === 0 || l2 === 0) return 0;
-  const dot = (v1.x * v2.x + v1.y * v2.y + v1.z * v2.z) / (l1 * l2);
+  const dot = (v1x * v2x + v1y * v2y + v1z * v2z) / (l1 * l2);
   return Math.acos(Math.min(1, Math.max(-1, dot)));
 }
 
+/** Builds an orthonormal frame as a matrix whose columns are forward, side, normal. */
+function basisMatrix(
+  forward: THREE.Vector3,
+  side: THREE.Vector3,
+  out: THREE.Matrix4,
+  scratch: { n: THREE.Vector3; s: THREE.Vector3 }
+): THREE.Matrix4 {
+  const n = scratch.n.crossVectors(forward, side).normalize();
+  const s = scratch.s.crossVectors(n, forward).normalize();
+  return out.makeBasis(forward, s, n);
+}
+
 /**
- * Poses the avatar's fingers from tracked hands.
+ * Poses the avatar's hands: the curl of each finger joint, and the rotation of
+ * the wrist itself.
  *
- * Only the bend of each joint is used, not its direction: a finger's curl is
- * the angle between its two adjacent segments, applied around the bone's own
- * curl axis. That deliberately ignores splay, which is far noisier than bend
- * and barely reads on screen.
+ * Finger curl uses only the bend — the angle between the two segments meeting
+ * at a joint — applied around the bone's own curl axis. That deliberately
+ * ignores splay, which is far noisier than bend and barely reads on screen.
  */
 export class FingerRetargeter {
   private vrm: VRM | undefined;
   private filters = new ScalarFilterBank(() => new OneEuroFilter(1.8, 0.03));
-  private current = new Map<VRMHumanBoneName, number>();
+  private curls = new Map<VRMHumanBoneName, number>();
+  private wristFilters = new ScalarFilterBank(() => new OneEuroFilter(1.4, 0.02));
+
+  private v = {
+    a: new THREE.Vector3(),
+    b: new THREE.Vector3(),
+    c: new THREE.Vector3(),
+    forward: new THREE.Vector3(),
+    side: new THREE.Vector3(),
+    n: new THREE.Vector3(),
+    s: new THREE.Vector3(),
+  };
+  private m = { measured: new THREE.Matrix4(), rest: new THREE.Matrix4() };
+  private q = {
+    measured: new THREE.Quaternion(),
+    rest: new THREE.Quaternion(),
+    target: new THREE.Quaternion(),
+    parent: new THREE.Quaternion(),
+  };
 
   bind(vrm: VRM): void {
     this.vrm = vrm;
-    this.current.clear();
+    this.curls.clear();
   }
 
   private drive(bone: VRMHumanBoneName, curl: number, side: "left" | "right", dt: number): void {
@@ -116,40 +111,104 @@ export class FingerRetargeter {
     // about z — negative on the left hand, positive on the right.
     const signed = side === "left" ? -smoothed : smoothed;
     node.rotation.z = signed;
-    this.current.set(bone, signed);
+    this.curls.set(bone, signed);
   }
 
-  apply(hands: TrackedHand[], dt: number): boolean {
-    if (!this.vrm || hands.length === 0) return false;
+  /**
+   * Solves the wrist from the palm itself. Two vectors define a hand's
+   * orientation — along the fingers, and across the knuckles — and the rotation
+   * that carries the rest pose's pair onto the measured pair is the wrist.
+   * This is the roll that a shoulder-to-elbow direction can never recover.
+   */
+  private driveWrist(hand: HandStream, side: "left" | "right", dt: number): void {
+    const vrm = this.vrm;
+    const bone: VRMHumanBoneName = side === "left" ? "leftHand" : "rightHand";
+    const node = vrm?.humanoid.getNormalizedBoneNode(bone);
+    if (!vrm || !node) return;
 
-    let posed = false;
-    for (const hand of hands) {
-      // Mirrored, like the arms: the person's right hand drives the avatar's
-      // left, so the avatar behaves like a reflection.
-      const side = hand.handedness === "Right" ? "left" : "right";
-      const prefix = side === "left" ? "left" : "right";
-      const lm = hand.landmarks;
-      if (lm.length < 21) continue;
+    const lm = hand.world;
+    if (lm.length < 21) return;
 
-      for (const finger of FINGERS) {
-        const [a, b, c, d] = finger.chain;
-        const isThumb = finger.name === "Thumb";
-        const names = isThumb ? THUMB_SEGMENTS : SEGMENTS;
-        const scale = isThumb ? THUMB_SCALE : 1;
+    const { a, b, c, forward, side: across, n, s } = this.v;
+    // Depth is kept in full here: the palm's facing is mostly a depth signal,
+    // and shrinking z would flatten every rotation this is meant to find.
+    const wrist = toAvatarSpace(lm[WRIST], a, 1);
+    const middle = toAvatarSpace(lm[MIDDLE_MCP], b, 1);
+    forward.subVectors(middle, wrist);
+    if (forward.lengthSq() < 1e-8) return;
+    forward.normalize();
 
-        // One angle per joint, each between the segments meeting at it.
-        const bends = [
-          angleBetween(lm[0], lm[a], lm[b]),
-          angleBetween(lm[a], lm[b], lm[c]),
-          angleBetween(lm[b], lm[c], lm[d]),
-        ];
+    const index = toAvatarSpace(lm[INDEX_MCP], b, 1);
+    const pinky = toAvatarSpace(lm[PINKY_MCP], c, 1);
+    across.subVectors(pinky, index);
+    if (across.lengthSq() < 1e-8) return;
+    across.normalize();
 
-        for (let i = 0; i < 3; i++) {
-          const bone = `${prefix}${finger.name}${names[i]}` as VRMHumanBoneName;
-          const curl = Math.min(MAX_CURL, Math.max(0, bends[i])) * scale;
-          this.drive(bone, curl, side, dt);
-        }
+    basisMatrix(forward, across, this.m.measured, { n, s });
+    const rest = REST_BASIS[side];
+    basisMatrix(rest.forward, rest.side, this.m.rest, { n, s });
+
+    this.q.measured.setFromRotationMatrix(this.m.measured);
+    this.q.rest.setFromRotationMatrix(this.m.rest);
+    // World rotation carrying rest onto measured.
+    this.q.target.copy(this.q.measured).multiply(this.q.rest.invert());
+
+    // Back out the arm's rotation so what is left is the wrist relative to the
+    // forearm, which is where the bone's rotation actually lives.
+    chainWorldQuaternion(vrm, FOREARM_CHAINS[side], this.q.parent);
+    this.q.target.premultiply(this.q.parent.invert());
+
+    // Cap it: a mis-solved palm normal otherwise wrenches the hand around.
+    const angle = 2 * Math.acos(Math.min(1, Math.abs(this.q.target.w)));
+    if (angle > MAX_WRIST_ANGLE) return;
+
+    this.q.rest.identity();
+    this.q.target.slerp(this.q.rest, 1 - WRIST_DAMPING);
+    node.quaternion.slerp(this.q.target, ease(12, dt));
+  }
+
+  private poseHand(hand: HandStream, side: "left" | "right", dt: number): void {
+    const lm = hand.landmarks;
+    if (lm.length < 21) return;
+    const prefix = side;
+
+    for (const finger of FINGERS) {
+      const [p1, p2, p3, p4] = finger.chain;
+      const isThumb = finger.name === "Thumb";
+      const names = isThumb ? THUMB_SEGMENTS : SEGMENTS;
+      const scale = isThumb ? THUMB_SCALE : 1;
+
+      // One angle per joint, each between the segments meeting at it.
+      const bends = [
+        angleBetween(lm[WRIST], lm[p1], lm[p2]),
+        angleBetween(lm[p1], lm[p2], lm[p3]),
+        angleBetween(lm[p2], lm[p3], lm[p4]),
+      ];
+
+      for (let i = 0; i < 3; i++) {
+        const bone = `${prefix}${finger.name}${names[i]}` as VRMHumanBoneName;
+        const curl = Math.min(MAX_CURL, Math.max(0, bends[i])) * scale;
+        this.drive(bone, curl, side, dt);
       }
+    }
+
+    this.driveWrist(hand, side, dt);
+  }
+
+  /**
+   * Mirrored, like the arms: the person's right hand drives the avatar's left,
+   * so the avatar behaves like a reflection. Holistic labels the hands itself,
+   * so nothing here has to guess which is which.
+   */
+  apply(left: HandStream | null, right: HandStream | null, dt: number): boolean {
+    if (!this.vrm) return false;
+    let posed = false;
+    if (right) {
+      this.poseHand(right, "left", dt);
+      posed = true;
+    }
+    if (left) {
+      this.poseHand(left, "right", dt);
       posed = true;
     }
     return posed;
@@ -157,14 +216,20 @@ export class FingerRetargeter {
 
   /** Opens the hands again when tracking is lost. */
   release(dt: number): void {
-    if (!this.vrm || this.current.size === 0) return;
-    const decay = 1 - Math.exp(-5 * dt);
-    for (const [bone, signed] of this.current) {
+    if (!this.vrm || this.curls.size === 0) return;
+    const decay = ease(5, dt);
+    for (const [bone, signed] of this.curls) {
       const node = this.vrm.humanoid.getNormalizedBoneNode(bone);
       if (!node) continue;
       const next = signed * (1 - decay);
       node.rotation.z = next;
-      this.current.set(bone, next);
+      this.curls.set(bone, next);
+    }
+    for (const side of ["left", "right"] as const) {
+      const node = this.vrm.humanoid.getNormalizedBoneNode(
+        side === "left" ? "leftHand" : "rightHand"
+      );
+      if (node) node.quaternion.slerp(this.q.rest.identity(), decay);
     }
   }
 }

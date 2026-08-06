@@ -1,5 +1,4 @@
 import type { VRM } from "@pixiv/three-vrm";
-import type { FaceResult } from "./face";
 import { OneEuroFilter, ScalarFilterBank } from "./filter";
 
 /**
@@ -54,9 +53,8 @@ export class ExpressionDriver {
     this.applied.set(name, value);
   }
 
-  apply(face: FaceResult, dt: number): void {
+  apply(shapes: Map<string, number>, dt: number): void {
     if (!this.vrm) return;
-    const { shapes } = face;
 
     // Smiling lifts the cheeks, which pushes the eye-blink scores up, so a
     // grinning face reads as a face blinking constantly. Back the blink off by
