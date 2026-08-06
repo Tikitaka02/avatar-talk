@@ -1,6 +1,10 @@
 import { PoseTracker } from "./tracking";
 import { AvatarViewer } from "./avatar";
 import { PoseRetargeter } from "./retarget";
+import { FaceTracker } from "./face";
+import { ExpressionDriver } from "./expression";
+import { HandTracker, FingerRetargeter } from "./hands";
+import { LandmarkFilter, OneEuroFilter } from "./filter";
 
 const video = document.getElementById("webcam") as HTMLVideoElement;
 const overlay = document.getElementById("overlay") as HTMLCanvasElement;
@@ -18,8 +22,17 @@ const DEFAULT_VRM = "/avatar/test-avatar-talk.vrm";
 const EXPRESSION_PRESETS = ["blink", "happy", "angry", "sad", "relaxed", "aa"];
 
 const tracker = new PoseTracker(video, overlay);
+const faceTracker = new FaceTracker(video);
+const handTracker = new HandTracker(video);
 const viewer = new AvatarViewer(avatarCanvas);
 const retargeter = new PoseRetargeter();
+const expressions = new ExpressionDriver();
+const fingers = new FingerRetargeter();
+
+// Jitter belongs to the measurement, so it is filtered at the source: every
+// angle derived downstream inherits the fix, and the retargeting stays a pure
+// function of the landmarks it is handed.
+const poseFilter = new LandmarkFilter(() => new OneEuroFilter(1.2, 0.02));
 
 /** Seconds without a usable pose before the avatar returns to its rest pose. */
 const TRACKING_GRACE = 0.5;
@@ -60,7 +73,11 @@ async function loadAvatar(source: string | File): Promise<void> {
   avatarStatusEl.classList.remove("hidden");
   try {
     await viewer.load(source);
-    if (viewer.vrm) retargeter.bind(viewer.vrm);
+    if (viewer.vrm) {
+      retargeter.bind(viewer.vrm);
+      expressions.bind(viewer.vrm);
+      fingers.bind(viewer.vrm);
+    }
     buildExpressionButtons();
     avatarStatusEl.classList.add("hidden");
   } catch (err) {
@@ -74,6 +91,42 @@ async function loadAvatar(source: string | File): Promise<void> {
 }
 
 // Drag and drop any .vrm file onto the 3D pane to swap avatars.
+// Optional readout: what the face model reports and what it maps to. A neutral
+// face still produces numbers, so it shows the pipeline is alive even when the
+// avatar's expression barely moves.
+const readoutEl = document.getElementById("readout") as HTMLDivElement;
+const showReadoutEl = document.getElementById("show-readout") as HTMLInputElement;
+const WATCHED_SHAPES = ["jawOpen", "mouthSmileLeft", "eyeBlinkLeft", "browDownLeft"];
+let readoutDue = 0;
+
+showReadoutEl.addEventListener("change", () => {
+  readoutEl.classList.toggle("hidden", !showReadoutEl.checked);
+});
+
+function bar(value: number): string {
+  const pct = Math.round(Math.min(1, Math.max(0, value)) * 100);
+  return `<span class="bar"><span style="width:${pct}%"></span></span>`;
+}
+
+function updateReadout(face: import("./face").FaceResult | null, hands: number, now: number): void {
+  if (!showReadoutEl.checked || now < readoutDue) return;
+  readoutDue = now + 100; // 10 Hz is plenty, and keeps DOM work off the frame budget
+
+  const rows: string[] = ['<div class="head">face model → blendshape</div>'];
+  for (const key of WATCHED_SHAPES) {
+    const v = face?.shapes.get(key) ?? 0;
+    rows.push(`<div class="row"><span>${key}</span>${bar(v)}<span>${v.toFixed(2)}</span></div>`);
+  }
+  rows.push('<div class="head">→ VRM expression</div>');
+  const driven = expressions.driven.filter(([, v]) => v > 0).slice(0, 4);
+  if (driven.length === 0) rows.push('<div class="row"><span>(neutral)</span></div>');
+  for (const [name, v] of driven) {
+    rows.push(`<div class="row"><span>${name}</span>${bar(v)}<span>${v.toFixed(2)}</span></div>`);
+  }
+  rows.push(`<div class="head">hands tracked: ${hands}</div>`);
+  readoutEl.innerHTML = rows.join("");
+}
+
 const dropZone = document.getElementById("avatar-pane") as HTMLDivElement;
 dropZone.addEventListener("dragover", (e) => {
   e.preventDefault();
@@ -96,11 +149,17 @@ function renderLoop(): void {
   // while the 3D scene redraws every frame so the idle motion stays smooth.
   const pose = tracker.update();
   if (pose) {
-    lastWorld = pose.world;
+    // Filter before retargeting, not after: this is the measurement being
+    // cleaned up, so everything downstream benefits.
+    lastWorld = poseFilter.apply(pose.world, delta);
     sinceTracked = 0;
   } else {
     sinceTracked += delta;
   }
+
+  // Face and hands are separate models on the same video frame.
+  const face = faceTracker.update();
+  const hands = handTracker.update();
 
   // The webcam delivers ~30 poses a second while the display refreshes faster,
   // so the last pose is re-applied every frame. That keeps the easing running
@@ -108,6 +167,14 @@ function renderLoop(): void {
   const fresh = lastWorld !== null && sinceTracked < TRACKING_GRACE;
   const posed = fresh && retargeter.apply(lastWorld!, delta);
   if (!posed) retargeter.releaseToRest(delta);
+
+  if (face) expressions.apply(face, delta);
+  else expressions.release(delta);
+  updateReadout(face, hands.length, now);
+
+  // Fingers are posed after the arms: they are children of the hand, so the
+  // arm rotation has to be settled first.
+  if (!fingers.apply(hands, delta)) fingers.release(delta);
 
   // Breathing would fight the tracked spine, so it only runs when idle.
   viewer.idleMotion = !posed;
@@ -136,6 +203,12 @@ async function main(): Promise<void> {
   try {
     statusEl.textContent = "Loading pose model…";
     await tracker.init();
+
+    // Face and hands are independent of the camera, and nothing waits on them:
+    // they download while the permission prompt is up, and start contributing
+    // whenever they are ready. The body moves from the first pose either way.
+    faceTracker.init().catch(() => {});
+    handTracker.init().catch(() => {});
 
     statusEl.textContent = "Requesting webcam…";
     await tracker.startWebcam();

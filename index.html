@@ -3,12 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Avatar Talk — Phase 2: VRM Avatar</title>
+    <title>Avatar Talk — Phase 4: Face, Hands and Filtering</title>
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
     <main>
-      <h1>Avatar Talk <span class="phase">phase 2 — VRM avatar</span></h1>
+      <h1>Avatar Talk <span class="phase">phase 4 — face, hands, filtering</span></h1>
       <div id="split">
         <div id="stage">
           <video id="webcam" autoplay playsinline muted></video>
@@ -19,11 +19,13 @@
           <canvas id="avatar"></canvas>
           <div id="avatar-status">Loading avatar…</div>
           <div class="drop-hint">drop a .vrm file here</div>
+          <div id="readout" class="hidden"></div>
         </div>
       </div>
       <div id="hud">
         <span id="fps">— fps</span>
         <label><input type="checkbox" id="mirror" checked /> mirror</label>
+        <label><input type="checkbox" id="show-readout" /> tracking readout</label>
         <div id="expressions"></div>
       </div>
     </main>

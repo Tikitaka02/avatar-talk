@@ -4,11 +4,11 @@ Browser-based motion capture that retargets your webcam movements onto a 3D
 avatar — built step by step as a YouTube / blog series. Everything runs
 client-side: no server, no installs, and no video ever leaves your machine.
 
-**Current state — Phase 3:** the avatar moves when you move. Upper-body pose
-tracking ([MediaPipe](https://ai.google.dev/edge/mediapipe) PoseLandmarker, lite
-model, GPU delegate) is retargeted onto a VRM rig rendered with three.js and
-[@pixiv/three-vrm](https://github.com/pixiv/three-vrm) — arms, torso and head,
-smoothed, with expression controls and drag-and-drop avatar swapping.
+**Current state — Phase 4:** three [MediaPipe](https://ai.google.dev/edge/mediapipe)
+models — pose, face and hands — drive a VRM rig rendered with three.js and
+[@pixiv/three-vrm](https://github.com/pixiv/three-vrm). Arms, torso and head
+follow your body; your expressions drive the avatar's face; your fingers curl
+its fingers. Landmarks are filtered with a One Euro filter before retargeting.
 
 ## Roadmap
 
@@ -17,7 +17,7 @@ smoothed, with expression controls and drag-and-drop avatar swapping.
 | 1 | Webcam + pose landmark overlay | `v1-landmarks` | ✅ done |
 | 2 | Loading a 3D VRM avatar (three.js + @pixiv/three-vrm) | `v2-avatar` | ✅ done |
 | 3 | Retargeting: landmarks → bone rotations | `v3-retargeting` | ✅ done |
-| 4 | Better smoothing, face expressions, hands, finger tracking | — | next |
+| 4 | One Euro filtering, face expressions, finger tracking | `v4-face-hands` | ✅ done |
 
 Each episode is a git tag, so you can check out exactly the code from any
 video: `git checkout v1-landmarks`.
@@ -32,8 +32,11 @@ npm run dev
 Open http://localhost:5173 and allow camera access. On the left you get your
 webcam with a green/pink skeleton over your face, torso and arms at ~30 fps; on
 the right, an avatar doing the same thing. Raise a hand and the avatar raises
-the hand on the same side of the screen — it behaves like a mirror. Drag on the
-3D pane to orbit the camera, and hold an expression button to change the face.
+the hand on the same side of the screen — it behaves like a mirror. Blink,
+smile or open your mouth and its face follows; curl your fingers and its
+fingers curl. Drag on the 3D pane to orbit the camera, tick **tracking readout**
+to see the blendshapes and the VRM expressions they drive, and hold an
+expression button to override the face by hand.
 
 **Bring your own avatar.** No `.vrm` is committed (they are large, and their
 licences are the author's), so the 3D pane starts empty. Drag any VRM file
@@ -49,18 +52,43 @@ much needs a connection — the video itself never leaves the machine.
 
 | File | What it does |
 |------|--------------|
-| [`src/tracking.ts`](src/tracking.ts) | Webcam capture, MediaPipe inference, skeleton overlay. Returns both screen-space landmarks (to draw) and metric world landmarks (to pose). |
-| [`src/avatar.ts`](src/avatar.ts) | three.js scene, VRM loading, auto-framing, rest pose, idle breathing, expressions. |
-| [`src/retarget.ts`](src/retarget.ts) | Landmarks → bone rotations: coordinate conversion, mirroring, parent-space solve, smoothing. |
-| [`src/main.ts`](src/main.ts) | Wires the three together in one render loop. |
+| [`src/tracking.ts`](src/tracking.ts) | Webcam capture, MediaPipe pose inference, skeleton overlay. Returns both screen-space landmarks (to draw) and metric world landmarks (to pose). |
+| [`src/face.ts`](src/face.ts) | FaceLandmarker: 52 ARKit-style blendshape scores plus a solved head transform. |
+| [`src/hands.ts`](src/hands.ts) | HandLandmarker (21 points per hand) and the finger retargeter. |
+| [`src/filter.ts`](src/filter.ts) | One Euro filter, plus banks of them for landmark streams and named scalars. |
+| [`src/expression.ts`](src/expression.ts) | Blendshapes → VRM expressions. |
+| [`src/retarget.ts`](src/retarget.ts) | Landmarks → bone rotations: coordinate conversion, mirroring, parent-space solve. |
+| [`src/avatar.ts`](src/avatar.ts) | three.js scene, VRM loading, auto-framing, rest pose, idle breathing. |
+| [`src/main.ts`](src/main.ts) | Wires them together in one render loop. |
+
+## Design notes (phase 4)
+
+- **Filter the input, not the output.** Phase 3 smoothed bone rotations at the
+  end of the pipeline; this filters landmarks at the start. Jitter is a property
+  of the measurement, so cleaning it at the source means every angle derived
+  afterwards inherits the fix. Measured on identical footage, frame-to-frame
+  change in the avatar pane fell from 2.67 to 1.92 — about 28% less movement.
+- **One Euro over a plain low-pass.** A fixed cutoff forces a choice between
+  jitter at rest and lag in motion. One Euro raises its own cutoff with speed,
+  so it filters hard when you hold still and gets out of the way when you move.
+- **Smiling makes you blink.** Raised cheeks push the eye-blink blendshapes up,
+  so a grinning avatar blinks nonstop. Subtracting `cheekSquint` fixes it.
+- **Bend only, no splay.** Finger curl is the angle between the two segments
+  meeting at each joint. Sideways splay is discarded: far noisier than bend, and
+  nearly invisible on a stylised hand.
+- **Handedness is anatomical.** MediaPipe's "Right" is the person's own right
+  hand — verified from landmark positions, not assumed — so it drives the
+  avatar's left, matching the mirrored body.
+- **Three models, one loop.** They share a video frame and a render loop; the
+  lite models hold 30 fps, but this is where the frame budget starts to matter.
 
 ## Known limitations
 
 - **No twist.** Rotations come from the shortest turn between two directions,
   which says nothing about roll — so a rotated forearm or a tilted wrist is not
   reproduced. Fixing it needs a second reference axis per bone.
-- **No fingers or facial tracking.** Hands are a single landmark each and the
-  face only drives head direction; the VRM's expressions are still manual.
+- **Expressions depend on the avatar.** Only the VRM expressions a model
+  actually defines can be driven; the mapping skips whatever is missing.
 - **Depth stays approximate** even with `Z_TRUST` — motion toward and away from
   the camera is the weakest axis, and always will be with one lens.
 - **Upper body only**, by design: legs are unreliable from a desk webcam.
