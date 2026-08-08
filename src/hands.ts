@@ -80,8 +80,20 @@ const MIDDLE_MCP = 9;
 const PINKY_MCP = 17;
 
 const MAX_CURL = 1.6;
-/** The thumb folds across the palm rather than curling, so it gets less. */
-const THUMB_SCALE = 0.55;
+/** The thumb has a shorter travel than the fingers, so its bend is scaled up. */
+const THUMB_SCALE = 1.4;
+
+/**
+ * An open hand does not measure as perfectly straight — fingers diverge a
+ * little at every joint, and the thumb leaves the wrist at a wide angle by
+ * anatomy rather than by flexing. Subtracting that resting angle stops the
+ * avatar from holding a permanent half-curl, and matters most for the thumb,
+ * whose first joint reads about 0.5 rad even when fully extended.
+ */
+const REST_BEND = { finger: 0.14, thumb: [0.45, 0.15, 0.03] };
+
+/** In the rest rig both palms face down, so the back of each hand faces +y. */
+const PALM_UP = new THREE.Vector3(0, 1, 0);
 
 /**
  * How much of the solved wrist rotation to keep. Palm orientation leans on
@@ -143,6 +155,8 @@ export class FingerRetargeter {
   private vrm: VRM | undefined;
   private filters = new ScalarFilterBank(() => new OneEuroFilter(1.8, 0.03));
   private curls = new Map<VRMHumanBoneName, number>();
+  /** Axis each finger bone folds about, derived from the rig at bind time. */
+  private curlAxes = new Map<VRMHumanBoneName, THREE.Vector3>();
   private wristFilters = new ScalarFilterBank(() => new OneEuroFilter(1.4, 0.02));
 
   private v = {
@@ -165,17 +179,49 @@ export class FingerRetargeter {
   bind(vrm: VRM): void {
     this.vrm = vrm;
     this.curls.clear();
+    this.curlAxes.clear();
+
+    // Work out which way each finger bone actually bends, from the rig rather
+    // than by assuming. Fingers lie along ±x so they hinge about z, but the
+    // thumb rests diagonally across the palm — rotating it about z splays it
+    // sideways instead of folding it in, which is why an assumed axis makes
+    // the thumb look like it is not tracking at all.
+    for (const side of ["left", "right"] as const) {
+      for (const finger of FINGERS) {
+        const names = finger.name === "Thumb" ? THUMB_SEGMENTS : SEGMENTS;
+        let previous: THREE.Vector3 | undefined;
+        for (let i = 0; i < names.length; i++) {
+          const bone = `${side}${finger.name}${names[i]}` as VRMHumanBoneName;
+          const node = vrm.humanoid.getNormalizedBoneNode(bone);
+          if (!node) continue;
+
+          // The next bone's local offset is this bone's direction. Local, not
+          // world: a bone's rotation is relative to its parent, and that stays
+          // true however the arm above it is posed.
+          const nextName = `${side}${finger.name}${names[i + 1]}` as VRMHumanBoneName;
+          const next = names[i + 1] ? vrm.humanoid.getNormalizedBoneNode(nextName) : null;
+          const dir = next?.position.lengthSq()
+            ? next.position.clone().normalize()
+            : previous?.clone();
+          if (!dir) continue;
+          previous = dir;
+
+          // Rotating about this axis folds the bone toward the palm.
+          const axis = new THREE.Vector3().crossVectors(PALM_UP, dir);
+          if (axis.lengthSq() < 1e-8) continue;
+          this.curlAxes.set(bone, axis.normalize());
+        }
+      }
+    }
   }
 
-  private drive(bone: VRMHumanBoneName, curl: number, side: "left" | "right", dt: number): void {
+  private drive(bone: VRMHumanBoneName, curl: number, dt: number): void {
     const node = this.vrm?.humanoid.getNormalizedBoneNode(bone);
-    if (!node) return;
+    const axis = this.curlAxes.get(bone);
+    if (!node || !axis) return;
     const smoothed = this.filters.filter(bone, curl, dt);
-    // Fingers point along ±x and curl toward the palm, which is a rotation
-    // about z — negative on the left hand, positive on the right.
-    const signed = side === "left" ? -smoothed : smoothed;
-    node.rotation.z = signed;
-    this.curls.set(bone, signed);
+    node.quaternion.setFromAxisAngle(axis, smoothed);
+    this.curls.set(bone, smoothed);
   }
 
   /**
@@ -259,8 +305,9 @@ export class FingerRetargeter {
 
       for (let i = 0; i < 3; i++) {
         const bone = `${prefix}${finger.name}${names[i]}` as VRMHumanBoneName;
-        const curl = Math.min(MAX_CURL, Math.max(0, bends[i])) * scale;
-        this.drive(bone, curl, side, dt);
+        const rest = isThumb ? REST_BEND.thumb[i] : REST_BEND.finger;
+        const curl = Math.min(MAX_CURL, Math.max(0, bends[i] - rest)) * scale;
+        this.drive(bone, curl, dt);
       }
     }
 
@@ -286,11 +333,12 @@ export class FingerRetargeter {
   release(dt: number): void {
     if (!this.vrm || this.curls.size === 0) return;
     const decay = ease(5, dt);
-    for (const [bone, signed] of this.curls) {
+    for (const [bone, curl] of this.curls) {
       const node = this.vrm.humanoid.getNormalizedBoneNode(bone);
-      if (!node) continue;
-      const next = signed * (1 - decay);
-      node.rotation.z = next;
+      const axis = this.curlAxes.get(bone);
+      if (!node || !axis) continue;
+      const next = curl * (1 - decay);
+      node.quaternion.setFromAxisAngle(axis, next);
       this.curls.set(bone, next);
     }
     for (const side of ["left", "right"] as const) {

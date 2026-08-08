@@ -79,6 +79,14 @@ much needs a connection — the video itself never leaves the machine.
 - **Bend only, no splay.** Finger curl is the angle between the two segments
   meeting at each joint. Sideways splay is discarded: far noisier than bend, and
   nearly invisible on a stylised hand.
+- **Each bone's hinge comes from the rig.** Fingers lie along ±x and so hinge
+  about z, but the thumb rests diagonally across the palm: rotating it about z
+  splays it sideways instead of folding it in, which looks exactly like a thumb
+  that is not tracking. Every finger bone's axis is now derived at load time
+  from where its child bone sits, so the thumb folds the way it should.
+- **Subtract the resting bend.** An open hand does not measure straight — the
+  thumb leaves the wrist at ~0.5 rad by anatomy, not by flexing. Without
+  subtracting that, the avatar holds a permanent half-curl.
 - **Handedness is anatomical.** MediaPipe's "Right" is the person's own right
   hand — verified from landmark positions, not assumed — so it drives the
   avatar's left, matching the mirrored body.
