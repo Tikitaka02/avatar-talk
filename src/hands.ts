@@ -1,9 +1,65 @@
 import * as THREE from "three";
 import type { VRM, VRMHumanBoneName } from "@pixiv/three-vrm";
-import type { Landmark } from "@mediapipe/tasks-vision";
-import type { HandStream } from "./tracking";
+import { HandLandmarker, type Landmark, type NormalizedLandmark } from "@mediapipe/tasks-vision";
+import { visionFileset, MODELS } from "./mediapipe";
 import { OneEuroFilter, ScalarFilterBank } from "./filter";
 import { toAvatarSpace, chainWorldQuaternion, FOREARM_CHAINS, ease } from "./space";
+
+export interface HandStream {
+  /** "Left" or "Right", as the model labels the person's own hand. */
+  handedness: string;
+  /** Image-space landmarks, for finger bend. */
+  landmarks: NormalizedLandmark[];
+  /** Metric landmarks, for solving the wrist's orientation. */
+  world: Landmark[];
+}
+
+export class HandTracker {
+  droppedFrames = 0;
+
+  private landmarker: HandLandmarker | undefined;
+  private lastVideoTime = -1;
+  private lastTimestamp = 0;
+  private last: HandStream[] = [];
+
+  constructor(private video: HTMLVideoElement) {}
+
+  async init(): Promise<void> {
+    const vision = await visionFileset();
+    this.landmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: MODELS.hand, delegate: "GPU" },
+      runningMode: "VIDEO",
+      numHands: 2,
+    });
+  }
+
+  get ready(): boolean {
+    return this.landmarker !== undefined;
+  }
+
+  /** Returns the previous result between camera frames so easing continues. */
+  update(): HandStream[] {
+    if (!this.landmarker || this.video.videoWidth === 0) return [];
+    if (this.video.currentTime === this.lastVideoTime) return this.last;
+    this.lastVideoTime = this.video.currentTime;
+
+    const timestamp = Math.max(this.lastTimestamp + 1, Math.round(performance.now()));
+    this.lastTimestamp = timestamp;
+
+    try {
+      const result = this.landmarker.detectForVideo(this.video, timestamp);
+      this.last = result.landmarks.map((landmarks, i) => ({
+        handedness: result.handedness[i]?.[0]?.categoryName ?? "Right",
+        landmarks,
+        world: result.worldLandmarks[i] ?? [],
+      }));
+      return this.last;
+    } catch {
+      this.droppedFrames++;
+      return [];
+    }
+  }
+}
 
 /** MediaPipe hand landmark indices, four joints per finger from knuckle to tip. */
 const FINGERS: { name: string; chain: [number, number, number, number] }[] = [
@@ -28,12 +84,20 @@ const MAX_CURL = 1.6;
 const THUMB_SCALE = 0.55;
 
 /**
- * Wrist rotation is damped and capped. Palm orientation depends on depth, the
- * weakest axis a single camera has, so a raw solve snaps around whenever the
- * model changes its mind about which way the hand is facing.
+ * How much of the solved wrist rotation to keep. Palm orientation leans on
+ * depth, the weakest axis a single camera has, so easing off a little keeps a
+ * mis-read palm from wrenching the hand.
  */
-const WRIST_DAMPING = 0.75;
-const MAX_WRIST_ANGLE = Math.PI * 0.6;
+const WRIST_DAMPING = 0.85;
+
+/**
+ * Ceiling on the wrist rotation, generous on purpose. Holding your palms at the
+ * camera is already ~90° away from the rest pose, where the palms face down, so
+ * a tight cap rejects ordinary poses. Rotations past this are scaled back to it
+ * rather than dropped: discarding a frame makes the hand stall and snap, which
+ * reads as the wrist not following at all.
+ */
+const MAX_WRIST_ANGLE = Math.PI * 0.75;
 
 /**
  * Rest orientation of each hand in the normalized rig. VRM's T-pose has the
@@ -158,12 +222,20 @@ export class FingerRetargeter {
     chainWorldQuaternion(vrm, FOREARM_CHAINS[side], this.q.parent);
     this.q.target.premultiply(this.q.parent.invert());
 
-    // Cap it: a mis-solved palm normal otherwise wrenches the hand around.
-    const angle = 2 * Math.acos(Math.min(1, Math.abs(this.q.target.w)));
-    if (angle > MAX_WRIST_ANGLE) return;
+    const identity = this.q.rest.identity();
 
-    this.q.rest.identity();
-    this.q.target.slerp(this.q.rest, 1 - WRIST_DAMPING);
+    // Scale an over-large rotation back to the ceiling instead of dropping it.
+    const angle = 2 * Math.acos(Math.min(1, Math.abs(this.q.target.w)));
+    if (angle > MAX_WRIST_ANGLE) {
+      this.q.target.slerp(identity, 1 - MAX_WRIST_ANGLE / angle);
+    }
+    this.q.target.slerp(identity, 1 - WRIST_DAMPING);
+
+    // The whole rotation goes on the hand. Anatomically most of this roll is
+    // the forearm, but the arm solve rewrites the forearm every frame by
+    // easing toward its own target: a twist added on top would be partly
+    // undone, re-added, and settle several times larger than intended. An
+    // absolute target on one bone cannot run away like that.
     node.quaternion.slerp(this.q.target, ease(12, dt));
   }
 
@@ -197,18 +269,14 @@ export class FingerRetargeter {
 
   /**
    * Mirrored, like the arms: the person's right hand drives the avatar's left,
-   * so the avatar behaves like a reflection. Holistic labels the hands itself,
-   * so nothing here has to guess which is which.
+   * so the avatar behaves like a reflection. MediaPipe's handedness is
+   * anatomical — "Right" is the person's own right hand.
    */
-  apply(left: HandStream | null, right: HandStream | null, dt: number): boolean {
-    if (!this.vrm) return false;
+  apply(hands: HandStream[], dt: number): boolean {
+    if (!this.vrm || hands.length === 0) return false;
     let posed = false;
-    if (right) {
-      this.poseHand(right, "left", dt);
-      posed = true;
-    }
-    if (left) {
-      this.poseHand(left, "right", dt);
+    for (const hand of hands) {
+      this.poseHand(hand, hand.handedness === "Right" ? "left" : "right", dt);
       posed = true;
     }
     return posed;

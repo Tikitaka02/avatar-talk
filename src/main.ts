@@ -1,8 +1,9 @@
-import { HolisticTracker, type TrackedFrame } from "./tracking";
+import { PoseTracker, type TrackedPose } from "./tracking";
 import { AvatarViewer } from "./avatar";
 import { PoseRetargeter } from "./retarget";
+import { FaceTracker } from "./face";
 import { ExpressionDriver } from "./expression";
-import { FingerRetargeter } from "./hands";
+import { HandTracker, FingerRetargeter } from "./hands";
 import { LandmarkFilter, OneEuroFilter } from "./filter";
 
 const video = document.getElementById("webcam") as HTMLVideoElement;
@@ -20,9 +21,13 @@ const DEFAULT_VRM = "/avatar/test-avatar-talk.vrm";
 // Expressions worth exposing as buttons, if the loaded avatar defines them.
 const EXPRESSION_PRESETS = ["blink", "happy", "angry", "sad", "relaxed", "aa"];
 
-// One model for body, face and hands: they share a person-detection stage
-// instead of each re-running their own on the same frame.
-const tracker = new HolisticTracker(video, overlay);
+// Three separate landmarkers rather than one Holistic task. Holistic shares a
+// person-detection stage, but measured here it is slightly slower, and asking
+// it for face blendshapes forces the whole task onto the CPU delegate. Separate
+// tasks also fail independently and load independently.
+const tracker = new PoseTracker(video, overlay);
+const faceTracker = new FaceTracker(video);
+const handTracker = new HandTracker(video);
 const viewer = new AvatarViewer(avatarCanvas);
 const retargeter = new PoseRetargeter();
 const expressions = new ExpressionDriver();
@@ -36,13 +41,12 @@ const poseFilter = new LandmarkFilter(() => new OneEuroFilter(1.2, 0.02));
 /** Seconds without a usable pose before the avatar returns to its rest pose. */
 const TRACKING_GRACE = 0.5;
 let sinceTracked = Infinity;
-let lastWorld: TrackedFrame["world"] | null = null;
+let lastWorld: TrackedPose["world"] | null = null;
 
 let frameCount = 0;
 let fpsWindowStart = performance.now();
 let lastFrame = performance.now();
-/** Kept between camera frames so easing continues on the last known tracking. */
-let lastFrameData: TrackedFrame | null = null;
+
 
 mirrorEl.addEventListener("change", () => {
   stage.classList.toggle("mirrored", mirrorEl.checked);
@@ -146,23 +150,21 @@ function renderLoop(): void {
   const delta = (now - lastFrame) / 1000;
   lastFrame = now;
 
-  // One loop drives both halves: a single inference returns body, face and
-  // hands together on new webcam frames, while the 3D scene redraws every
-  // frame so easing and idle motion stay smooth.
-  const frame = tracker.update();
-  if (frame) {
+  // One loop drives both halves: tracking only advances on new webcam frames,
+  // while the 3D scene redraws every frame so the easing stays smooth.
+  const pose = tracker.update();
+  if (pose) {
     // Filter before retargeting, not after: this is the measurement being
     // cleaned up, so everything downstream benefits.
-    lastWorld = poseFilter.apply(frame.world, delta);
+    lastWorld = poseFilter.apply(pose.world, delta);
     sinceTracked = 0;
-    lastFrameData = frame;
   } else {
     sinceTracked += delta;
-    // Stop re-applying tracking that has gone stale, or the face and hands
-    // would hold their last expression indefinitely after you leave frame.
-    if (sinceTracked >= TRACKING_GRACE) lastFrameData = null;
   }
-  const face = lastFrameData?.faceShapes ?? null;
+
+  // Face and hands are separate models reading the same video frame.
+  const face = faceTracker.update();
+  const hands = handTracker.update();
 
   // The webcam delivers ~30 poses a second while the display refreshes faster,
   // so the last pose is re-applied every frame. That keeps the easing running
@@ -171,22 +173,19 @@ function renderLoop(): void {
   const posed = fresh && retargeter.apply(lastWorld!, delta);
   if (!posed) retargeter.releaseToRest(delta);
 
-  if (face) expressions.apply(face, delta);
+  if (face) expressions.apply(face.shapes, delta);
   else expressions.release(delta);
-
-  const left = lastFrameData?.leftHand ?? null;
-  const right = lastFrameData?.rightHand ?? null;
-  updateReadout(face, (left ? 1 : 0) + (right ? 1 : 0), now);
+  updateReadout(face?.shapes ?? null, hands.length, now);
 
   // Fingers are posed after the arms: they are children of the hand, so the
   // arm rotation has to be settled first.
-  if (!fingers.apply(left, right, delta)) fingers.release(delta);
+  if (!fingers.apply(hands, delta)) fingers.release(delta);
 
   // Breathing would fight the tracked spine, so it only runs when idle.
   viewer.idleMotion = !posed;
   viewer.update(delta);
 
-  if (frame) {
+  if (pose) {
     frameCount++;
     const elapsed = now - fpsWindowStart;
     if (elapsed >= 1000) {
@@ -209,6 +208,12 @@ async function main(): Promise<void> {
   try {
     statusEl.textContent = "Loading pose model…";
     await tracker.init();
+
+    // Face and hands are independent of the camera and nothing waits on them:
+    // they download while the permission prompt is up and start contributing
+    // whenever they are ready. The body moves from the first pose either way.
+    faceTracker.init().catch(() => {});
+    handTracker.init().catch(() => {});
 
     statusEl.textContent = "Requesting webcam…";
     await tracker.startWebcam();
